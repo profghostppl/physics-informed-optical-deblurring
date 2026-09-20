@@ -3,6 +3,8 @@
 A non-generative neural architecture that reverses camera-lens defocus blur using
 real optical physics and known (or EXIF-derived) camera hardware parameters —
 focal length, f-number, sensor pixel pitch, focus distance, and subject distance.
+The optics model covers geometric defocus, diffraction-limited blur (Airy disk),
+and per-RGB-channel chromatic dispersion, not just a single achromatic blur circle.
 
 **Core principle: recover, don't hallucinate.** This is not a diffusion model or an
 unconstrained GAN. It never invents plausible-looking detail that wasn't in the
@@ -85,6 +87,76 @@ not learned from scratch):
    The kernel itself is a differentiable soft-edged disk (sigmoid-relaxed pillbox),
    so gradients can flow back through it to the physical parameters that produced it.
 
+   `unfolded_optics_deblur.py` implements this base architecture
+   (`UnfoldedOpticsDeblurNet`, single achromatic kernel per HQS stage). Every script
+   in this repository actually runs the **upgraded** version below by default.
+
+## Advanced optics engine
+
+`advanced_optics_kernel_engine.py` upgrades kernel generation beyond the single
+achromatic geometric pillbox above — it reuses `unfolded_optics_deblur.py`'s own
+CoC derivation rather than duplicating it, and adds:
+
+1. **Diffraction-limited PSF (`AdvancedOpticsKernelEngine`).** At narrow apertures
+   or small pixel pitches, geometric optics alone under-predicts blur — wave optics
+   (diffraction) contributes a real, non-negligible Airy disk. The engine convolves
+   the geometric defocus pillbox with a true Airy diffraction pattern in the Fourier
+   domain:
+
+   ```
+   I(r) = [ 2*J1(v) / v ]^2,   v = 3.8317 * r / r0,   r0 = 1.22 * lambda * N
+   ```
+
+   `torch.special.bessel_j1` has no autograd support in current PyTorch (verified:
+   `.backward()` raises), so `J1` is evaluated via the Numerical Recipes
+   rational/asymptotic polynomial approximation instead — fully differentiable,
+   accurate to ~1e-8.
+
+2. **Per-channel chromatic dispersion.** A two-term Cauchy dispersion relation
+   `n(lambda) = A + B/lambda_um^2` gives each RGB wavelength its own effective focal
+   length (fed back through the *same* CoC formula above), so red/green/blue get
+   genuinely different defocus radii — a real 3-channel kernel `(B,3,Hk,Wk)`, not one
+   kernel repeated three times. A `dispersion_strength` parameter (0 = achromatic
+   lens, 1 = uncorrected single glass element) controls how much of the theoretical
+   single-element dispersion survives a real compound lens's correction.
+
+3. **Depth-guided spatially variant deconvolution** (`DepthToKernelField` +
+   `OverlapAddSpatialDeconv`). A monocular relative depth map is soft-binned into a
+   handful of representative-distance kernels; the image is deconvolved patch-wise
+   with a per-patch blend of those kernels, then reassembled with Hann-window
+   Overlap-Add, renormalized by the folded window energy so reconstruction is exact
+   (no visible seams) regardless of window shape.
+
+4. **Kernel-adaptive edge taper** (`DifferentiableEdgeTaper`). Before any `rfft2`
+   call, the image is blended with its own circular self-blur, weighted by a border
+   ramp whose *shape* is derived from the kernel's own cumulative energy profile
+   (wide/soft kernels taper over a wide/soft border; narrow/sharp kernels taper
+   sharply) — suppressing the Gibbs-ringing a hard image boundary would otherwise
+   inject into FFT-based deconvolution.
+
+5. **OTF zero-crossing safeguard** (`StabilizedMultiChannelWienerDeconv`). The
+   Wiener regularizer is parametrized as `mu_k = softplus(alpha_k) + eps`, which
+   floors the denominator `|K_fft|^2 + mu_k` strictly above zero *even exactly at* a
+   diffraction OTF's Bessel null (`|K_fft| -> 0`) — bounding the noise-amplification
+   gain everywhere in the spectrum, not just where the kernel happens to be
+   well-conditioned. (The base model's data step instead parametrizes `mu_k =
+   exp(alpha_k)`, which is also always positive but has no explicit floor.)
+
+`AdvancedUnfoldedOpticsDeblurNet` (same file) is a drop-in upgrade of
+`UnfoldedOpticsDeblurNet` — identical `forward(y_srgb, kernel, sigma)` interface —
+that swaps in `StabilizedMultiChannelWienerDeconv` for every HQS stage's data step
+and adds two convenience entry points:
+
+- `forward_from_camera(y_srgb, sigma, f, N, pitch, d0, d)` — camera metadata straight
+  in, kernel built internally.
+- `forward_full_frame(y_srgb, sigma, depth_map, f, N, pitch, d0, d_min, d_max)` — runs
+  every HQS stage patch-wise across a full image via the depth-guided Overlap-Add
+  path above.
+
+`UnfoldedOpticsDeblurNet` and the plain achromatic pillbox kernel remain available
+in `unfolded_optics_deblur.py` as the base architecture the advanced engine builds
+on (and as a smaller, faster path when diffraction/dispersion aren't needed).
+
 ## Real-world camera metadata pipeline
 
 - **EXIF extraction** (`exif_utils.py`) pulls focal length and f-number directly
@@ -127,12 +199,28 @@ reconstruction), auto noise-level estimation (a classical, non-learned estimator
 Immerkaer 1996 — computed correctly in linear-light space), and both a
 region-only and a full-photo-with-region-restored download.
 
+The app runs `AdvancedUnfoldedOpticsDeblurNet` (diffraction + per-channel chromatic
+dispersion) by default. If `outputs/checkpoint.pt` was trained on the older,
+single-achromatic-kernel architecture, the app loads whichever tensors still match
+(the learned denoiser) and randomly re-initializes the rest (the optics data step)
+rather than discarding the checkpoint outright — a sidebar note explains when this
+happens.
+
 ## Project structure
 
 ```
-unfolded_optics_deblur.py   Core architecture: InvertibleISP, AnalyticalWienerDeconv,
+unfolded_optics_deblur.py     Base architecture: InvertibleISP, AnalyticalWienerDeconv,
                              LipschitzProximalDenoiser, UnfoldedOpticsDeblurNet.
                              Includes a self-contained __main__ shape/gradient test.
+advanced_optics_kernel_engine.py  Diffraction + chromatic-dispersion optics engine:
+                             AdvancedOpticsKernelEngine, DepthToKernelField,
+                             DifferentiableEdgeTaper, StabilizedMultiChannelWienerDeconv,
+                             OverlapAddSpatialDeconv, AdvancedUnfoldedOpticsDeblurNet.
+                             Includes a self-contained __main__ verification block.
+training_optics_utils.py      Exact thin-lens CoC inversion used by the training
+                             scripts to sample physically self-consistent camera
+                             metadata for a target blur radius (see "Training
+                             methodology" below).
 exif_utils.py                Real-EXIF camera metadata extraction.
 camera_sensor_db.py           Sensor-format fallback database for incomplete EXIF.
 noise_estimation.py           Classical (non-learned) noise-level estimator.
@@ -162,11 +250,17 @@ build first (see comments in `requirements.txt`).
 ## Usage
 
 ```bash
-# Architecture self-test (shapes, gradient flow) -- no data needed
+# Base architecture self-test (shapes, gradient flow) -- no data needed
 python unfolded_optics_deblur.py
 
-# Single real-photo demo: synthesize blur with the project's own optics model,
-# then fit the network to it (a per-image sanity check, not a trained model)
+# Advanced optics engine self-test (diffraction, chromatic dispersion, depth-guided
+# Overlap-Add, OTF zero-crossing safeguard, full AdvancedUnfoldedOpticsDeblurNet
+# integration) -- no data needed
+python advanced_optics_kernel_engine.py
+
+# Single real-photo demo: synthesize diffraction + chromatic-dispersion blur with the
+# project's own optics model, then fit the network to it (a per-image sanity check,
+# not a trained model)
 python demo_real_image.py
 
 # Train on public sample photographs (no personal data required)
@@ -199,6 +293,18 @@ train/validation split **once, deterministically, from its hash**, so held-out
 validation stays a stable comparison point as more photos are added over time,
 rather than reshuffling on every run.
 
+Both training scripts sample a *target* geometric blur radius uniformly and
+*solve* the thin-lens CoC equation for the subject distance that reproduces it
+exactly (`training_optics_utils.py`), rather than sampling a free defocus offset
+and clamping the resulting radius after the fact. Measured on the old
+sample-then-clamp approach: without a clamp, 31% of samples exceeded the kernel
+window (max observed radius ~245px), and the clamp step discarded the subject
+distance that had produced the pre-clamp radius — harmless when only a scalar
+radius fed a single achromatic kernel, but no longer harmless now that
+`AdvancedOpticsKernelEngine` uses f-number and pixel pitch independently for
+diffraction and focal length independently for dispersion, so a physically
+consistent (f, N, pitch, d0, d) tuple actually matters.
+
 ### A real bug this workflow caught
 
 Early real-photo testing surfaced a genuine failure mode: on night/low-light
@@ -224,9 +330,12 @@ real generalization gap.
   Mode) before the JPEG is saved, which the single-exposure `y = Kx + n` model
   this project assumes does not describe as well as it does a single DSLR/
   mirrorless exposure.
-- **Shift-invariant blur only.** The Wiener step assumes one blur kernel for the
-  whole processed region — correct for a single depth plane, which is why the app
-  restricts processing to a user-selected crop rather than a whole photo.
+- **Shift-invariant blur only, in the app.** Each `forward()` call assumes one blur
+  kernel for the whole processed region — correct for a single depth plane, which is
+  why the app restricts processing to a user-selected crop rather than a whole
+  photo. `AdvancedUnfoldedOpticsDeblurNet.forward_full_frame` (depth-guided,
+  patch-wise Overlap-Add) removes this restriction given a monocular depth map, but
+  is not yet wired into the Streamlit UI.
 - **This is a research/demonstration-scale project**, trained on a personally
   curated photo archive (not included in this repository — see below), not a
   large public benchmark dataset.
