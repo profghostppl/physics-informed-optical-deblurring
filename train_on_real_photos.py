@@ -1,5 +1,5 @@
 """
-Train UnfoldedOpticsDeblurNet on the user's OWN real photographs (Fujifilm X-S10,
+Train AdvancedUnfoldedOpticsDeblurNet on the user's OWN real photographs (Fujifilm X-S10,
 EXIF intact), instead of the 6 generic scikit-image stock photos used in
 train_on_dataset.py.
 
@@ -45,13 +45,9 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from PIL import Image
 
-from unfolded_optics_deblur import (
-    InvertibleISP,
-    UnfoldedOpticsDeblurNet,
-    circle_of_confusion_diameter_m,
-    defocus_diameter_to_pixel_radius,
-    make_soft_pillbox_kernel,
-)
+from unfolded_optics_deblur import InvertibleISP
+from advanced_optics_kernel_engine import AdvancedOpticsKernelEngine, AdvancedUnfoldedOpticsDeblurNet
+from training_optics_utils import sample_subject_distance_for_radius
 from exif_utils import extract_camera_metadata
 from dataset_sync import sync_from_source, sync_files, ARCHIVE_DIR
 
@@ -110,6 +106,8 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 device = torch.device("cpu")
 isp = InvertibleISP()
+KERNEL_ENGINE_KWARGS = dict(dispersion_strength=0.15, combine_mode="fourier")
+kernel_engine = AdvancedOpticsKernelEngine(**KERNEL_ENGINE_KWARGS)
 
 PATCH = 96
 KSIZE = 25
@@ -161,10 +159,14 @@ print("Held-out files:", val_names)
 REAL_PARAM_POOL = np.array(train_params)  # (N, 3): focal_length_mm, f_number, pixel_pitch_m
 
 
-def sample_real_camera_params(n: int) -> torch.Tensor:
+def sample_real_camera_params(n: int) -> tuple[torch.Tensor, ...]:
     """Bootstrap-resample (f, N, pitch) triples from this camera's REAL EXIF values,
-    preserving real joint correlations, then derive the resulting blur pixel radius.
-    Focus/subject distance are NOT in EXIF (see module docstring) -- randomly sampled.
+    preserving real joint correlations. Focus/subject distance are NOT in EXIF (see
+    module docstring), so subject distance is instead *solved for* (via
+    `training_optics_utils`) to hit a uniformly sampled target geometric radius in
+    [1.0, 9.5]px -- see that module for why this replaced a free-sample-then-clamp
+    approach. Returns the raw (focal_length_m, f_number, pixel_pitch_m,
+    focus_distance_m, subject_distance_m) tuple `AdvancedOpticsKernelEngine` needs.
     """
     idx = np.random.randint(0, len(REAL_PARAM_POOL), size=n)
     sampled = REAL_PARAM_POOL[idx]  # (n, 3)
@@ -173,20 +175,23 @@ def sample_real_camera_params(n: int) -> torch.Tensor:
     pixel_pitch_m = torch.tensor(sampled[:, 2], dtype=torch.float32)
 
     focus_distance_m = torch.empty(n).uniform_(0.8, 3.0)
-    delta = torch.empty(n).uniform_(0.4, 1.8) * (torch.randint(0, 2, (n,)) * 2 - 1)
-    subject_distance_m = (focus_distance_m + delta).clamp_min(0.3)
-
-    b_m = circle_of_confusion_diameter_m(focal_length_m, f_number, focus_distance_m, subject_distance_m)
-    radius_px = defocus_diameter_to_pixel_radius(b_m, pixel_pitch_m)
-    return radius_px.clamp(1.0, 9.5)  # keep within the KSIZE=25 window with margin
+    radius_px_target = torch.empty(n).uniform_(1.0, 9.5)
+    want_background = torch.randint(0, 2, (n,)).bool()
+    subject_distance_m = sample_subject_distance_for_radius(
+        focal_length_m, f_number, pixel_pitch_m, focus_distance_m, radius_px_target, want_background
+    )
+    return focal_length_m, f_number, pixel_pitch_m, focus_distance_m, subject_distance_m
 
 
 def apply_batched_psf(x: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
+    """Convolve each batch sample's (3,H,W) image with its OWN per-channel (3,kh,kw)
+    dispersion-aware kernel -- each RGB channel convolved with its own wavelength's PSF.
+    """
     b, c, h, w = x.shape
-    _, _, kh, kw = kernel.shape
+    _, kc, kh, kw = kernel.shape
     pad_h, pad_w = kh // 2, kw // 2
     x_pad = F.pad(x, (pad_w, pad_w, pad_h, pad_h), mode="reflect")
-    weight = kernel.repeat_interleave(c, dim=0)
+    weight = kernel.reshape(b * kc, 1, kh, kw)
     x_reshaped = x_pad.reshape(1, b * c, x_pad.shape[-2], x_pad.shape[-1])
     out = F.conv2d(x_reshaped, weight, groups=b * c)
     return out.reshape(b, c, h, w)
@@ -210,8 +215,10 @@ def sample_batch(images: list, batch_size: int, generator: torch.Generator = Non
         patches.append(patch)
     sharp = torch.stack(patches, dim=0)
 
-    radius_px = sample_real_camera_params(batch_size)
-    kernel = make_soft_pillbox_kernel(radius_px, ksize=KSIZE, softness_px=0.6)
+    focal_length_m, f_number, pixel_pitch_m, focus_distance_m, subject_distance_m = sample_real_camera_params(batch_size)
+    kernel = kernel_engine(
+        focal_length_m, f_number, pixel_pitch_m, focus_distance_m, subject_distance_m, ksize=KSIZE
+    )  # (B,3,K,K)
 
     sharp_linear = isp.to_linear(sharp)
     blurry_linear = apply_batched_psf(sharp_linear, kernel)
@@ -240,7 +247,9 @@ REAL_PARAM_POOL = _train_pool_backup
 val_is_night = [val_tags[i] == "night_subset" for i in val_source_idx]
 print(f"Fixed val batch: {sum(val_is_night)}/{VAL_BATCH_SIZE} patches are from night-tagged photos")
 
-model = UnfoldedOpticsDeblurNet(num_stages=6, base_ch=16).to(device)
+model = AdvancedUnfoldedOpticsDeblurNet(
+    num_stages=6, base_ch=16, kernel_engine_kwargs=KERNEL_ENGINE_KWARGS
+).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=2e-3)
 
 TARGET_SECONDS = 360  # bumped from 300s: larger, more diverse dataset (76 vs 40 photos, 2 lenses)
@@ -262,7 +271,9 @@ print(f"Calibration: {iter_time*1000:.1f} ms/iter -> running {TOTAL_ITERS} itera
       f"(~{TOTAL_ITERS*iter_time:.0f}s), validating every {VAL_EVERY} iters")
 
 torch.manual_seed(0)
-model = UnfoldedOpticsDeblurNet(num_stages=6, base_ch=16).to(device)
+model = AdvancedUnfoldedOpticsDeblurNet(
+    num_stages=6, base_ch=16, kernel_engine_kwargs=KERNEL_ENGINE_KWARGS
+).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=2e-3)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=TOTAL_ITERS)
 

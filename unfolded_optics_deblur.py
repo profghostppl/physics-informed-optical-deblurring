@@ -46,7 +46,7 @@ implementation.
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -448,16 +448,50 @@ class UnfoldedOpticsDeblurNet(nn.Module):
     output is re-encoded to sRGB before being returned.
     """
 
-    def __init__(self, num_stages: int = 6, base_ch: int = 32, in_ch: int = 3):
+    def __init__(
+        self,
+        num_stages: int = 6,
+        base_ch: int = 32,
+        in_ch: int = 3,
+        data_step_factory: Optional[Callable[[], nn.Module]] = None,
+    ):
+        """
+        Args:
+            data_step_factory: zero-arg callable returning a fresh data-fidelity module
+                for one HQS stage, with the same interface as `AnalyticalWienerDeconv`
+                (`forward(y, kernel, z) -> x_half`). Defaults to
+                `AnalyticalWienerDeconv(init_mu=1.0)`. This is the extension point
+                `AdvancedUnfoldedOpticsDeblurNet` (in `advanced_optics_kernel_engine.py`)
+                uses to swap in `StabilizedMultiChannelWienerDeconv` -- everything else
+                about the unrolled architecture (priors, ISP, stage loop) is unchanged.
+        """
         super().__init__()
         self.num_stages = num_stages
         self.isp = InvertibleISP()
-        self.data_steps = nn.ModuleList(
-            [AnalyticalWienerDeconv(init_mu=1.0) for _ in range(num_stages)]
-        )
+        if data_step_factory is None:
+            data_step_factory = lambda: AnalyticalWienerDeconv(init_mu=1.0)
+        self.data_steps = nn.ModuleList([data_step_factory() for _ in range(num_stages)])
         self.priors = nn.ModuleList(
             [LipschitzProximalDenoiser(in_ch=in_ch, base_ch=base_ch) for _ in range(num_stages)]
         )
+
+    def _run_stages(
+        self,
+        y_linear: torch.Tensor,
+        kernel: torch.Tensor,
+        sigma: torch.Tensor,
+        use_learned_prior: bool = True,
+    ) -> torch.Tensor:
+        """The K-stage HQS loop itself, factored out of `forward` (which only adds the
+        ISP conversions around it) so it can be reused directly on already-linear,
+        already-patchified tensors -- e.g. by a patch-wise Overlap-Add driver that must
+        convert to linear space and fold patches back together *outside* the loop.
+        """
+        z = y_linear
+        for k in range(self.num_stages):
+            x_half = self.data_steps[k](y_linear, kernel, z)
+            z = self.priors[k](x_half, sigma) if use_learned_prior else x_half
+        return z
 
     def forward(
         self,
@@ -473,7 +507,9 @@ class UnfoldedOpticsDeblurNet(nn.Module):
                     Typically produced from camera metadata via
                     `circle_of_confusion_diameter_m` -> `defocus_diameter_to_pixel_radius`
                     -> `make_soft_pillbox_kernel`, or supplied directly from a calibrated /
-                    depth-derived kernel estimate.
+                    depth-derived kernel estimate. A (B, 3, Hk, Wk) per-channel kernel
+                    (e.g. from `AdvancedOpticsKernelEngine`) also works unchanged: every
+                    data step broadcasts a shared or per-channel kernel identically.
             sigma: (B, 1, H, W) estimated per-pixel noise standard deviation (sensor
                    read + shot noise floor), in the same linear-light units as y_linear.
             use_learned_prior: when True (default), each stage's closed-form Wiener
@@ -490,10 +526,7 @@ class UnfoldedOpticsDeblurNet(nn.Module):
             x_restored: (B, 3, H, W) restored image in sRGB [0,1].
         """
         y_linear = self.isp.to_linear(y_srgb)
-        z = y_linear
-        for k in range(self.num_stages):
-            x_half = self.data_steps[k](y_linear, kernel, z)
-            z = self.priors[k](x_half, sigma) if use_learned_prior else x_half
+        z = self._run_stages(y_linear, kernel, sigma, use_learned_prior=use_learned_prior)
         x_restored_linear = z.clamp(0.0, 1.0)
         x_restored = self.isp.to_srgb(x_restored_linear)
         return x_restored

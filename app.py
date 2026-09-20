@@ -29,13 +29,8 @@ import torch
 from PIL import Image
 from streamlit_cropper import st_cropper
 
-from unfolded_optics_deblur import (
-    InvertibleISP,
-    UnfoldedOpticsDeblurNet,
-    circle_of_confusion_diameter_m,
-    defocus_diameter_to_pixel_radius,
-    make_soft_pillbox_kernel,
-)
+from unfolded_optics_deblur import InvertibleISP, circle_of_confusion_diameter_m, defocus_diameter_to_pixel_radius
+from advanced_optics_kernel_engine import AdvancedUnfoldedOpticsDeblurNet
 from exif_utils import extract_camera_metadata
 from noise_estimation import estimate_noise_sigma
 
@@ -56,12 +51,29 @@ def to_linear_np(srgb_np: np.ndarray) -> np.ndarray:
 
 @st.cache_resource
 def load_model():
-    model = UnfoldedOpticsDeblurNet(num_stages=6, base_ch=16)
+    model = AdvancedUnfoldedOpticsDeblurNet(
+        num_stages=6, base_ch=16, kernel_engine_kwargs=dict(dispersion_strength=0.15, combine_mode="fourier")
+    )
     loaded_checkpoint = False
     if CKPT_PATH.exists():
         try:
-            model.load_state_dict(torch.load(CKPT_PATH, map_location="cpu"))
+            state = torch.load(CKPT_PATH, map_location="cpu")
+            own_state = model.state_dict()
+            # A checkpoint saved by the previous single-achromatic-kernel architecture
+            # has differently-shaped `data_steps.*` tensors (scalar mu vs. this model's
+            # per-channel mu) -- keep whichever tensors still match exactly (the learned
+            # denoiser, `priors.*`, is architecturally unchanged) and let the rest fall
+            # back to random init, rather than discarding the whole checkpoint.
+            compatible = {k: v for k, v in state.items() if k in own_state and own_state[k].shape == v.shape}
+            model.load_state_dict(compatible, strict=False)
             loaded_checkpoint = True
+            if len(compatible) < len(own_state):
+                st.sidebar.info(
+                    f"Checkpoint was trained on the previous architecture: loaded "
+                    f"{len(compatible)}/{len(own_state)} matching tensors (the learned "
+                    "denoiser); the upgraded optics data step was randomly re-"
+                    "initialized. Re-run train_on_dataset.py for a fully trained checkpoint."
+                )
         except Exception as e:
             st.sidebar.error(f"Checkpoint found but failed to load ({e}); using random init.")
     model.eval()
@@ -243,14 +255,21 @@ with col2:
             focus_distance_t = torch.tensor([focus_distance_m])
             subject_distance_t = torch.tensor([subject_distance_m])
 
+            # Quick geometric-only radius estimate, purely to size/cap the kernel
+            # window for CPU-feasible processing before invoking the full
+            # diffraction+dispersion engine (which derives its own, per-channel
+            # radius from the raw camera parameters below).
             b_m = circle_of_confusion_diameter_m(
                 focal_length_t, f_number_t, focus_distance_t, subject_distance_t
             )
             radius_px_raw = defocus_diameter_to_pixel_radius(b_m, pixel_pitch_t)
             radius_px = radius_px_raw.clamp(0.5, 25.0)
             ksize = int(2 * np.ceil(radius_px.item() * 1.6) + 1)
-            kernel = make_soft_pillbox_kernel(radius_px, ksize=ksize, softness_px=0.6)
             was_clamped = abs(radius_px.item() - radius_px_raw.item()) > 1e-6
+
+            kernel = model.build_kernel(
+                focal_length_t, f_number_t, pixel_pitch_t, focus_distance_t, subject_distance_t, ksize=ksize
+            )
 
             sigma_map = torch.full((1, 1, y.shape[-2], y.shape[-1]), float(sigma_val))
 
@@ -262,7 +281,8 @@ with col2:
         restored_np = restored.squeeze(0).permute(1, 2, 0).numpy()
         st.image(restored_np, use_container_width=True, clamp=True)
         st.caption(
-            f"Blur kernel radius: {radius_px.item():.2f}px (kernel {ksize}x{ksize}) | "
+            f"Blur kernel radius: {radius_px.item():.2f}px (kernel {ksize}x{ksize}, "
+            f"per-RGB-channel diffraction + chromatic dispersion) | "
             f"CoC diameter: {b_m.item()*1e3:.3f} mm"
         )
         if was_clamped:

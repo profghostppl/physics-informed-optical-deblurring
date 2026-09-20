@@ -1,5 +1,5 @@
 """
-Multi-image dataset training for UnfoldedOpticsDeblurNet (replaces the earlier
+Multi-image dataset training for AdvancedUnfoldedOpticsDeblurNet (replaces the earlier
 single-image overfit demo with a proper train/held-out-validation split).
 
 Since this environment has no internet-fetched dataset available, the "dataset" is
@@ -9,11 +9,13 @@ large, diverse training distribution via:
   * random-crop patches (many distinct crops per source photo)
   * random horizontal/vertical flip augmentation
   * a *different randomly sampled optical configuration per patch* -- focal length,
-    f-number, focus distance and subject distance are drawn from realistic ranges and
-    passed through the same `circle_of_confusion_diameter_m` -> pixel-radius ->
-    `make_soft_pillbox_kernel` pipeline used by the architecture itself, so every
-    training patch has its own physically-derived defocus kernel and noise level
-    (heteroscedastic sigma)
+    f-number, pixel pitch and focus distance are drawn from realistic ranges, and the
+    subject distance is *solved for* (via `training_optics_utils`) so the resulting
+    geometric defocus radius lands where intended, before the whole (f, N, pitch, d0,
+    d) tuple is passed through `AdvancedOpticsKernelEngine` -- the same diffraction +
+    chromatic-dispersion optical model the architecture itself uses -- so every
+    training patch has its own physically-derived, per-RGB-channel defocus+diffraction
+    kernel and noise level (heteroscedastic sigma)
   * a train/validation split at the IMAGE level: validation photographs (a cat photo
     and a retinal fundus photo) are held out completely and never seen during
     training, so validation PSNR measures generalization to unseen scene content and
@@ -35,13 +37,9 @@ import matplotlib.pyplot as plt
 from skimage import data, img_as_float
 from skimage.transform import resize
 
-from unfolded_optics_deblur import (
-    InvertibleISP,
-    UnfoldedOpticsDeblurNet,
-    circle_of_confusion_diameter_m,
-    defocus_diameter_to_pixel_radius,
-    make_soft_pillbox_kernel,
-)
+from unfolded_optics_deblur import InvertibleISP
+from advanced_optics_kernel_engine import AdvancedOpticsKernelEngine, AdvancedUnfoldedOpticsDeblurNet
+from training_optics_utils import sample_subject_distance_for_radius
 
 torch.manual_seed(0)
 np.random.seed(0)
@@ -51,6 +49,8 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 device = torch.device("cpu")
 isp = InvertibleISP()
+KERNEL_ENGINE_KWARGS = dict(dispersion_strength=0.15, combine_mode="fourier")
+kernel_engine = AdvancedOpticsKernelEngine(**KERNEL_ENGINE_KWARGS)
 
 PATCH = 96
 KSIZE = 25
@@ -83,27 +83,38 @@ print("Train source images:", [tuple(t.shape) for t in TRAIN_SOURCES])
 print("Val   source images:", [tuple(t.shape) for t in VAL_SOURCES])
 
 
-def sample_camera_params(n: int) -> torch.Tensor:
-    """Sample n random, physically-plausible optical configs -> pixel blur radius."""
+def sample_camera_params(n: int) -> tuple[torch.Tensor, ...]:
+    """Sample n random, physically-plausible camera configs whose GEOMETRIC defocus
+    radius is drawn uniformly from [1.0, 9.5]px (the KSIZE=25 window's usable range),
+    by solving for the subject distance that reproduces each target radius exactly
+    (see `training_optics_utils` for why, and for the measured old-vs-new comparison).
+    Returns the raw (focal_length_m, f_number, pixel_pitch_m, focus_distance_m,
+    subject_distance_m) tuple `AdvancedOpticsKernelEngine` needs, not a pre-baked
+    radius -- it derives the diffraction + chromatic-dispersion kernel from these
+    directly.
+    """
     focal_length_m = torch.empty(n).uniform_(0.035, 0.135)     # 35-135mm
     f_number = torch.empty(n).uniform_(1.4, 5.6)
     pixel_pitch_m = torch.empty(n).uniform_(6.0e-5, 1.0e-4)    # effective per-pixel footprint
     focus_distance_m = torch.empty(n).uniform_(0.8, 3.0)
-    delta = torch.empty(n).uniform_(0.4, 1.8) * (torch.randint(0, 2, (n,)) * 2 - 1)
-    subject_distance_m = (focus_distance_m + delta).clamp_min(0.3)
+    radius_px_target = torch.empty(n).uniform_(1.0, 9.5)
+    want_background = torch.randint(0, 2, (n,)).bool()
 
-    b_m = circle_of_confusion_diameter_m(focal_length_m, f_number, focus_distance_m, subject_distance_m)
-    radius_px = defocus_diameter_to_pixel_radius(b_m, pixel_pitch_m)
-    return radius_px.clamp(1.0, 9.5)   # keep within the KSIZE=25 window with margin
+    subject_distance_m = sample_subject_distance_for_radius(
+        focal_length_m, f_number, pixel_pitch_m, focus_distance_m, radius_px_target, want_background
+    )
+    return focal_length_m, f_number, pixel_pitch_m, focus_distance_m, subject_distance_m
 
 
 def apply_batched_psf(x: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
-    """Convolve each batch sample's (3,H,W) image with its OWN (1,kh,kw) kernel."""
+    """Convolve each batch sample's (3,H,W) image with its OWN per-channel (3,kh,kw)
+    dispersion-aware kernel -- each RGB channel convolved with its own wavelength's PSF.
+    """
     b, c, h, w = x.shape
-    _, _, kh, kw = kernel.shape
+    _, kc, kh, kw = kernel.shape
     pad_h, pad_w = kh // 2, kw // 2
     x_pad = F.pad(x, (pad_w, pad_w, pad_h, pad_h), mode="reflect")
-    weight = kernel.repeat_interleave(c, dim=0)          # (B*C,1,kh,kw)
+    weight = kernel.reshape(b * kc, 1, kh, kw)            # (B*C,1,kh,kw)
     x_reshaped = x_pad.reshape(1, b * c, x_pad.shape[-2], x_pad.shape[-1])
     out = F.conv2d(x_reshaped, weight, groups=b * c)
     return out.reshape(b, c, h, w)
@@ -124,8 +135,10 @@ def sample_batch(sources, batch_size: int, generator: torch.Generator = None):
         patches.append(patch)
     sharp = torch.stack(patches, dim=0)                                   # (B,3,PATCH,PATCH)
 
-    radius_px = sample_camera_params(batch_size)
-    kernel = make_soft_pillbox_kernel(radius_px, ksize=KSIZE, softness_px=0.6)  # (B,1,K,K)
+    focal_length_m, f_number, pixel_pitch_m, focus_distance_m, subject_distance_m = sample_camera_params(batch_size)
+    kernel = kernel_engine(
+        focal_length_m, f_number, pixel_pitch_m, focus_distance_m, subject_distance_m, ksize=KSIZE
+    )  # (B,3,K,K)
 
     sharp_linear = isp.to_linear(sharp)
     blurry_linear = apply_batched_psf(sharp_linear, kernel)
@@ -152,7 +165,9 @@ val_blurry, val_kernel, val_sigma, val_sharp = sample_batch(VAL_SOURCES, VAL_BAT
 # ---------------------------------------------------------------------------
 # Model / optimizer
 # ---------------------------------------------------------------------------
-model = UnfoldedOpticsDeblurNet(num_stages=6, base_ch=16).to(device)
+model = AdvancedUnfoldedOpticsDeblurNet(
+    num_stages=6, base_ch=16, kernel_engine_kwargs=KERNEL_ENGINE_KWARGS
+).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=2e-3)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1000)
 
@@ -180,7 +195,9 @@ print(f"Calibration: {iter_time*1000:.1f} ms/iter -> running {TOTAL_ITERS} itera
 
 # re-init model/optimizer so the warmup steps don't bias the reported curve
 torch.manual_seed(0)
-model = UnfoldedOpticsDeblurNet(num_stages=6, base_ch=16).to(device)
+model = AdvancedUnfoldedOpticsDeblurNet(
+    num_stages=6, base_ch=16, kernel_engine_kwargs=KERNEL_ENGINE_KWARGS
+).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=2e-3)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=TOTAL_ITERS)
 
@@ -246,7 +263,7 @@ axes[1].set_xlabel("Iteration")
 axes[1].set_ylabel("PSNR (dB)")
 axes[1].legend(fontsize=9)
 
-fig.suptitle(f"UnfoldedOpticsDeblurNet training on real-photo dataset "
+fig.suptitle(f"AdvancedUnfoldedOpticsDeblurNet training on real-photo dataset "
              f"({len(TRAIN_SOURCES)} train images / {len(VAL_SOURCES)} held-out val images)")
 fig.tight_layout(rect=[0, 0, 1, 0.94])
 curves_path = os.path.join(OUT_DIR, "training_curves.png")
