@@ -6,17 +6,27 @@ What this can and cannot honestly give you
 * Focal length (f) and f-number/aperture (N): standard EXIF fields
   (`FocalLength`, `FNumber`), present on almost all camera-shot JPEGs. Reliable.
 
-* Sensor pixel pitch (p): NOT usually stored directly, but derivable from
-  `FocalPlaneXResolution` / `FocalPlaneYResolution` + `FocalPlaneResolutionUnit` +
-  the image's pixel dimensions -- these three together give the sensor's physical
-  width, from which pixel pitch follows with no camera-model lookup table needed.
-  Present on many cameras (all Fujifilm bodies tested so far) but genuinely ABSENT
-  from others -- e.g. older Nikon DSLRs (D60, D5100) never write these tags at all,
-  confirmed by inspecting their raw EXIF. For those, we fall back to a small table of
-  publicly published sensor widths for specific (Make, Model) pairs -- this is a
-  documented hardware spec keyed by camera model, not a per-photo EXIF reading, so
-  it's reported with a distinct, lower-confidence `pixel_pitch_source`. Unknown
-  models with no focal-plane data get `pixel_pitch_m = None`, same as before.
+* Sensor pixel pitch (p): NOT usually stored directly, but derivable three ways,
+  tried in order of decreasing precision:
+    1. `FocalPlaneXResolution` / `FocalPlaneYResolution` + `FocalPlaneResolutionUnit`
+       + the image's pixel dimensions -- these three together give the sensor's
+       physical width directly, no camera-model lookup table needed. Present on many
+       cameras (all Fujifilm bodies tested so far) but genuinely ABSENT from others
+       -- e.g. older Nikon DSLRs (D60, D5100) never write these tags at all,
+       confirmed by inspecting their raw EXIF.
+    2. A small table of publicly published sensor widths for specific (Make, Model)
+       pairs (`camera_sensor_db.py`) -- an exact documented hardware spec, but only
+       covers models someone has explicitly added to the table.
+    3. The standard `FocalLengthIn35mmFilm` tag (35mm-equivalent focal length),
+       divided by the actual `FocalLength` to get the lens's crop factor, then
+       `36mm / crop_factor` for sensor width. This tag is present on nearly every
+       camera with any auto/program exposure mode (required for flash-metering
+       compatibility) -- including cameras that omit `FocalPlaneXResolution`
+       entirely -- and needs no per-model database entry. Less precise than tier 2
+       (both source fields are typically camera-rounded to the nearest mm), so it's
+       only tried after an exact per-model lookup fails.
+  Each tier is reported with a distinct `pixel_pitch_source` so callers can show its
+  confidence. Cameras that fail all three get `pixel_pitch_m = None`.
 
 * Focus distance (d0) and subject distance (d): there IS a standard `SubjectDistance`
   EXIF tag, but in practice most manufacturers leave it unpopulated, hardcode it to
@@ -34,7 +44,7 @@ from typing import Optional, Union, BinaryIO
 
 from PIL import Image, ExifTags
 
-from camera_sensor_db import lookup_sensor_width_m
+from camera_sensor_db import lookup_sensor_width_m, SENSOR_FORMATS_M
 
 _EXIF_IFD_TAG = 0x8769  # "Exif IFD Pointer" -- FocalLength/FNumber/FocalPlane* live here
 
@@ -62,7 +72,9 @@ class CameraMetadata:
     focal_length_mm: Optional[float] = None
     f_number: Optional[float] = None
     pixel_pitch_m: Optional[float] = None
-    pixel_pitch_source: Optional[str] = None       # "exif_focal_plane" or None
+    pixel_pitch_source: Optional[str] = None       # "exif_focal_plane" |
+                                                     # "known_sensor_fallback" |
+                                                     # "exif_35mm_crop_factor" | None
     subject_distance_m: Optional[float] = None      # low-confidence when present
     subject_distance_confidence: str = "none"        # "none" | "low"
     image_width: Optional[int] = None
@@ -132,6 +144,16 @@ def extract_camera_metadata(image_source: Union[str, BinaryIO]) -> CameraMetadat
             if sensor_width_m:
                 meta.pixel_pitch_m = sensor_width_m / meta.image_width
                 meta.pixel_pitch_source = "known_sensor_fallback"
+            else:
+                # Third fallback: derive sensor width from the standard 35mm-
+                # equivalent crop factor. No per-camera-model database entry
+                # needed -- see the module docstring for why this is tried last.
+                focal_length_35mm = _to_float(tags.get("FocalLengthIn35mmFilm"))
+                if focal_length_35mm and focal_length_35mm > 0 and meta.focal_length_mm:
+                    crop_factor = focal_length_35mm / meta.focal_length_mm
+                    sensor_width_m = SENSOR_FORMATS_M["full_frame_35mm"] / crop_factor
+                    meta.pixel_pitch_m = sensor_width_m / meta.image_width
+                    meta.pixel_pitch_source = "exif_35mm_crop_factor"
 
         # SubjectDistance: standard tag, but notoriously unreliable across vendors.
         subj_dist = _to_float(tags.get("SubjectDistance"))

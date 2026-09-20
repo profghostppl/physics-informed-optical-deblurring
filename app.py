@@ -164,6 +164,15 @@ elif meta.pixel_pitch_m and meta.pixel_pitch_source == "known_sensor_fallback":
         f"for {meta.make} {meta.model}, not a per-photo EXIF reading -- verify if precision matters."
     )
     default_pitch_um = meta.pixel_pitch_m * 1e6
+elif meta.pixel_pitch_m and meta.pixel_pitch_source == "exif_35mm_crop_factor":
+    st.sidebar.caption(
+        f"This camera writes neither focal-plane-resolution EXIF nor a recognized "
+        f"model in the sensor-spec table, so pixel pitch ({meta.pixel_pitch_m * 1e6:.2f} um) "
+        "is derived from the photo's own 35mm-equivalent focal length (crop factor) "
+        "-- per-photo, but less precise than a published spec since both source "
+        "fields are typically camera-rounded to the nearest mm -- verify if precision matters."
+    )
+    default_pitch_um = meta.pixel_pitch_m * 1e6
 else:
     st.sidebar.caption("Pixel pitch not in EXIF and camera model not recognized -- estimate, or leave the default.")
     default_pitch_um = 5.0

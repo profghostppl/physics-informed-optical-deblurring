@@ -173,6 +173,13 @@ on (and as a smaller, faster path when diffraction/dispersion aren't needed).
   and its honest caveats (mirror-vs-mirrorless is *not* a physical variable here;
   smartphone sensor sizes are approximate and computational photography weakens
   this project's core single-exposure physical model for phone photos).
+- **35mm-equivalent crop-factor fallback** — for cameras that write neither
+  `FocalPlaneXResolution` nor match an entry in the sensor database, `exif_utils.py`
+  falls back once more to the standard `FocalLengthIn35mmFilm` tag (present on
+  nearly any camera with an auto/program exposure mode): `36mm / (35mm-equivalent
+  focal length / actual focal length)` gives sensor width with no per-model lookup
+  needed. Less precise than the database (both source fields are typically
+  camera-rounded to the nearest mm) but per-photo and universally available.
 - **What's honestly NOT recoverable from EXIF**: focus distance and subject
   distance have no reliable standard EXIF field across vendors — documented
   clearly in `exif_utils.py` rather than silently guessed. The app exposes these
