@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.idea/
+
+# Real personal photos and derived artifacts -- deliberately never published.
+# dataset/sharp/ holds real photos (family, wedding guests, a child) contributed
+# for local model training; none of those people consented to public posting.
+# manifest.json records their original folder paths/names, so it's excluded too.
+dataset/sharp/
+dataset/blurry/
+dataset/manifest.json
+
+# Trained checkpoint: a binary build artifact derived from the private photos above,
+# and easy to regenerate locally via train_on_real_photos.py / train_on_dataset.py.
+outputs/checkpoint.pt
+
+# Qualitative panel rendered from real personal photos (crops of the dataset above).
+# training_curves_real.png is kept -- it's just a loss/PSNR chart, no photo content.
+outputs/validation_qualitative_real.png
+
+# Claude Code project state (not relevant to other users/contributors)
+.claude/

@@ -1,0 +1,21 @@
+# Core model (unfolded_optics_deblur.py)
+torch>=2.2
+
+# Demo / training scripts (demo_real_image.py, train_on_dataset.py)
+numpy>=1.24
+scikit-image>=0.22
+matplotlib>=3.8
+
+# Upload/download interface (app.py) + camera metadata extraction (exif_utils.py)
+streamlit>=1.32
+streamlit-cropper>=0.3
+pillow>=10.0
+scipy>=1.10
+
+# Notes:
+# - This pulls whatever torch build pip resolves for your platform. On a machine with
+#   an NVIDIA GPU you generally get better performance installing the CUDA build
+#   explicitly instead, e.g.:
+#     pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   The CPU-only build used to develop/verify this repo was installed via:
+#     pip install torch --index-url https://download.pytorch.org/whl/cpu
